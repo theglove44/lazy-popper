@@ -38,9 +38,11 @@ Lazy Popper is a Typer-based command line tool that quickly finds and paper-ente
    ```
 
 ## CLI overview
-There are only two commands:
+The `TT` entry point exposes four Typer commands:
 - `TT buy` builds a bull put credit spread (short put near your desired absolute delta, long put further OTM).
 - `TT sell` builds a bear call credit spread (short call near your desired absolute delta, long call further OTM).
+- `TT settle` scans your CSV for expirations in the past (optionally including today) and prints which trades are ready to be settled live.
+- `TT stats` aggregates CSV fields (counts, average delta/width/credit, theoretical P/L, etc.) so you can sanity-check your dataset quickly.
 
 Both commands share the same options (Typer exposes them as `--option value`):
 
@@ -58,6 +60,23 @@ Both commands share the same options (Typer exposes them as `--option value`):
 | `--max-scan` | `250` | Hard cap on total strikes scanned for safety.
 
 Every run fetches a one-shot index quote, streams greeks to find the best short option, finds the corresponding long leg, quotes both legs for mid/bid/ask, rounds the credit to the correct SPX tick, and places a tastytrade `dry_run` order so you can inspect buying power and fee impact without touching real capital.
+
+### Settlement & stats helpers
+Once trades have expired in your CSV, run:
+
+```bash
+TT settle --csv-path ./paper_trades.csv --include-today
+```
+
+You will see a summary of all rows whose expiration date is in the past (or also today if you pass `--include-today`), grouped by expiry with total quantity and max P/L. A small preview of the matching rows is printed so you can push them through whatever manual settlement workflow you prefer.
+
+After you have settled trades (for example by editing `status`, `pnl_usd_net`, etc. in the CSV), `TT stats` gives you a quick scoreboard:
+
+```bash
+TT stats --csv-path ./paper_trades.csv
+```
+
+This command reports total trades, win/loss counts by `cmd`, top symbols, average absolute short delta, average width/credit, theoretical aggregate P/L, and the notional credit logged so far. Both helper commands respect the same `--csv-path` flag as the trading commands, so you can point them to alternative datasets.
 
 ## CSV output
 Every simulated trade is appended to `paper_trades.csv` (or the path you set via `--csv-path`/`TT_PAPER_CSV`). Columns match the CLI internals and downstream notebooks/tools can rely on them being present:
