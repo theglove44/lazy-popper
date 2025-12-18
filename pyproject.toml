@@ -1,0 +1,14 @@
+[project]
+name = "tt-paper"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "tastytrade",
+  "typer",
+  "rich",
+  "python-dotenv",
+  "PyYAML",
+]
+
+[project.scripts]
+TT = "ttpaper.cli:app"

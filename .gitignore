@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+paper_trades.csv
+paper_trades_*.csv
