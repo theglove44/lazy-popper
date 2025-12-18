@@ -6,12 +6,14 @@ import json
 import os
 import time
 import uuid
+from collections import Counter, defaultdict
+from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv()  # loads .env from current working directory (and parents)
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
@@ -270,6 +272,204 @@ def _csv_write_row(path: str, row: dict) -> None:
         w.writerow(row)
 
 
+def _read_csv(path: str) -> tuple[list[str], list[dict[str, str]]]:
+    csv_path = Path(path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {path}")
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        header = list(reader.fieldnames or [])
+        rows = list(reader)
+    return header, rows
+
+
+def _safe_float(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _mean(values: list[float]) -> Optional[float]:
+    return sum(values) / len(values) if values else None
+
+
+def settle_csv(csv_path: str, *, include_today: bool = False) -> list[dict[str, str]]:
+    try:
+        _, rows = _read_csv(csv_path)
+    except FileNotFoundError as exc:
+        rprint(f"[red]{exc}[/red]")
+        return []
+
+    if not rows:
+        rprint({"csv": csv_path, "message": "CSV is empty."})
+        return []
+
+    today = datetime.now(timezone.utc).date()
+    ready: list[tuple[date, dict[str, str]]] = []
+    parse_errors = 0
+
+    for row in rows:
+        exp_str = row.get("exp")
+        if not exp_str:
+            continue
+        try:
+            exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+        except ValueError:
+            parse_errors += 1
+            continue
+
+        if exp_date < today or (include_today and exp_date == today):
+            ready.append((exp_date, row))
+
+    if not ready:
+        rprint(
+            {
+                "csv": csv_path,
+                "message": f"No trades ready to settle (include_today={include_today}).",
+                "parse_errors": parse_errors,
+            }
+        )
+        return []
+
+    ready.sort(key=lambda item: (item[0], item[1].get("paper_id", "")))
+
+    grouped = defaultdict(lambda: {"rows": 0, "qty": 0, "max_profit": 0.0, "max_loss": 0.0})
+    details: list[dict[str, object]] = []
+
+    for exp_date, row in ready:
+        exp_key = exp_date.isoformat()
+        data = grouped[exp_key]
+        data["rows"] += 1
+
+        qty = _safe_int(row.get("qty"))
+        data["qty"] += qty
+
+        mp = _safe_float(row.get("max_profit_usd")) or 0.0
+        ml = _safe_float(row.get("max_loss_usd")) or 0.0
+        data["max_profit"] += mp
+        data["max_loss"] += ml
+
+        details.append(
+            {
+                "paper_id": row.get("paper_id"),
+                "cmd": row.get("cmd"),
+                "right": row.get("right"),
+                "exp": exp_key,
+                "qty": qty,
+                "limit_credit_points": _safe_float(row.get("limit_credit_points")),
+                "width_points": _safe_float(row.get("width_points")),
+            }
+        )
+
+    exp_summary = [
+        {
+            "exp": exp,
+            "rows": data["rows"],
+            "qty": data["qty"],
+            "max_profit": round(data["max_profit"], 2),
+            "max_loss": round(data["max_loss"], 2),
+        }
+        for exp, data in sorted(grouped.items())
+    ]
+
+    rprint(
+        {
+            "csv": csv_path,
+            "ready_to_settle": len(ready),
+            "expirations": exp_summary,
+            "parse_errors": parse_errors,
+        }
+    )
+
+    preview_n = min(10, len(details))
+    rprint({"preview": details[:preview_n]})
+
+    return [row for _, row in ready]
+
+
+def print_stats(csv_path: str) -> dict:
+    try:
+        _, rows = _read_csv(csv_path)
+    except FileNotFoundError as exc:
+        rprint(f"[red]{exc}[/red]")
+        return {}
+
+    if not rows:
+        rprint({"csv": csv_path, "message": "CSV is empty."})
+        return {}
+
+    per_cmd = Counter((row.get("cmd") or "unknown").lower() for row in rows)
+    per_symbol = Counter((row.get("symbol") or "unknown").upper() for row in rows)
+
+    qty_total = 0
+    delta_vals: list[float] = []
+    width_vals: list[float] = []
+    credit_vals: list[float] = []
+    max_profit_sum = 0.0
+    max_loss_sum = 0.0
+    notional_credit = 0.0
+    first_created: Optional[str] = None
+    last_created: Optional[str] = None
+
+    for row in rows:
+        qty = _safe_int(row.get("qty"))
+        qty_total += qty
+
+        delta = _safe_float(row.get("short_delta"))
+        if delta is not None:
+            delta_vals.append(abs(delta))
+
+        width = _safe_float(row.get("width_points"))
+        if width is not None:
+            width_vals.append(width)
+
+        credit = _safe_float(row.get("limit_credit_points"))
+        if credit is not None:
+            credit_vals.append(credit)
+            notional_credit += credit * qty * float(SPX_MULTIPLIER)
+
+        mp = _safe_float(row.get("max_profit_usd"))
+        if mp is not None:
+            max_profit_sum += mp
+
+        ml = _safe_float(row.get("max_loss_usd"))
+        if ml is not None:
+            max_loss_sum += ml
+
+        created = row.get("created_at_utc")
+        if created:
+            if not first_created or created < first_created:
+                first_created = created
+            if not last_created or created > last_created:
+                last_created = created
+
+    stats = {
+        "csv": csv_path,
+        "rows": len(rows),
+        "total_qty": qty_total,
+        "by_command": dict(per_cmd),
+        "top_symbols": per_symbol.most_common(5),
+        "avg_abs_short_delta": round(_mean(delta_vals), 4) if delta_vals else None,
+        "avg_width_points": round(_mean(width_vals), 2) if width_vals else None,
+        "avg_credit_points": round(_mean(credit_vals), 2) if credit_vals else None,
+        "total_theoretical_max_profit": round(max_profit_sum, 2),
+        "total_theoretical_max_loss": round(max_loss_sum, 2),
+        "notional_credit": round(notional_credit, 2),
+        "created_range": {"first": first_created, "last": last_created},
+    }
+
+    rprint(stats)
+    return stats
+
+
 def _paper_enter(
     *,
     side: str,  # "buy" -> put credit, "sell" -> call credit
@@ -479,5 +679,17 @@ def sell(
         stop_n=stop_n,
         max_scan=max_scan,
     )
+
+
+@app.command()
+def settle(csv_path: str = "./paper_trades.csv", include_today: bool = False):
+    """List trades whose expiration date has passed."""
+    settle_csv(csv_path, include_today=include_today)
+
+
+@app.command()
+def stats(csv_path: str = "./paper_trades.csv"):
+    """Print aggregate stats about logged paper trades."""
+    print_stats(csv_path)
 if __name__ == "__main__":
     app()
