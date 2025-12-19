@@ -5,3 +5,4 @@ __pycache__/
 *.egg-info/
 paper_trades.csv
 paper_trades_*.csv
+AGENTS.md

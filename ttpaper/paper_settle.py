@@ -5,12 +5,12 @@ Settle SPXW paper trades to expiration and write results back into paper_trades.
 Assumptions:
 - Trades are 5-wide (or any width) SPXW vertical *credit* spreads.
 - SPXW is PM-settled based on the closing level of the S&P 500 index on expiration day.
-- We approximate settlement using SPX daily close from Stooq unless you override with --settlement.
+- We approximate settlement using SPX daily close from Yahoo Finance (^GSPC) unless you override with --settlement.
 
 Usage:
   python paper_settle.py --csv ./paper_trades.csv
   python paper_settle.py --csv ./paper_trades.csv --exp 2025-12-18 --settlement 6731.17
-  python paper_settle.py --csv ./paper_trades.csv --source stooq
+  python paper_settle.py --csv ./paper_trades.csv --source yahoo
 
 Outputs:
 - Updates/creates columns: status, settled_at_utc, settlement_spx, payoff_points,
@@ -85,37 +85,78 @@ def _ymd(date_iso: str) -> str:
     return date_iso.replace("-", "")
 
 
-def fetch_spx_close_stooq(date_iso: str) -> float:
+def fetch_spx_close_yahoo(date_iso: str) -> float:
     """
-    Fetch SPX daily close for a single date from Stooq CSV endpoint.
+    Fetch SPX daily close for a single trading date using Yahoo Finance chart API (^GSPC).
 
-    Uses:
-      https://stooq.com/q/d/l/?s=^spx&i=d&d1=YYYYMMDD&d2=YYYYMMDD
+    Endpoint:
+      https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?interval=1d&period1=...&period2=...
+
+    We request a small window around date_iso and select the candle whose *America/New_York* date
+    matches date_iso.
+
+    Note: if date_iso is a market holiday/weekend, Yahoo may not return a candle for that date.
     """
     if requests is None:
         raise RuntimeError("requests is not installed; add it to requirements.txt")
 
-    ymd = _ymd(date_iso)
-    url = f"https://stooq.com/q/d/l/?s=%5Espx&i=d&d1={ymd}&d2={ymd}"
-    r = requests.get(url, timeout=20)
+    try:
+        from zoneinfo import ZoneInfo  # py3.9+
+        ny = ZoneInfo("America/New_York")
+        def to_ny_date(ts: int) -> dt.date:
+            return dt.datetime.fromtimestamp(int(ts), tz=dt.timezone.utc).astimezone(ny).date()
+    except Exception:  # pragma: no cover
+        def to_ny_date(ts: int) -> dt.date:  # type: ignore
+            return dt.datetime.fromtimestamp(int(ts), tz=dt.timezone.utc).date()
+
+    try:
+        d = dt.date.fromisoformat(date_iso)
+    except ValueError as e:
+        raise RuntimeError(f"Bad date_iso {date_iso!r}") from e
+
+    # Pull a 3-day window to robustly include the trading day.
+    start = dt.datetime(d.year, d.month, d.day, tzinfo=dt.timezone.utc) - dt.timedelta(days=1)
+    end = dt.datetime(d.year, d.month, d.day, tzinfo=dt.timezone.utc) + dt.timedelta(days=2)
+    period1 = int(start.timestamp())
+    period2 = int(end.timestamp())
+
+    url = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC"
+        f"?interval=1d&period1={period1}&period2={period2}&events=history"
+    )
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, timeout=20, headers=headers)
     r.raise_for_status()
-    text = r.text.strip()
-    if not text:
-        raise RuntimeError(f"Empty response from Stooq for {date_iso}")
+    data = r.json()
 
-    lines = text.splitlines()
-    if len(lines) < 2:
-        raise RuntimeError(f"No rows returned from Stooq for {date_iso} (maybe a holiday?)")
+    chart = (data or {}).get("chart") or {}
+    error = chart.get("error")
+    if error:
+        raise RuntimeError(f"Yahoo chart error for {date_iso}: {error}")
 
-    reader = csv.DictReader(lines)
-    row = next(reader, None)
-    if not row or "Close" not in row:
-        raise RuntimeError(f"Unexpected CSV format from Stooq for {date_iso}")
-    close = _parse_float(row["Close"])
-    if not math.isfinite(close):
-        raise RuntimeError(f"Bad Close value from Stooq for {date_iso}: {row.get('Close')}")
-    return close
+    results = chart.get("result") or []
+    if not results:
+        raise RuntimeError(f"No Yahoo chart result for {date_iso}")
 
+    res0 = results[0]
+    ts_list = res0.get("timestamp") or []
+    indicators = (res0.get("indicators") or {}).get("quote") or []
+    if not indicators:
+        raise RuntimeError("Yahoo response missing indicators.quote")
+    closes = indicators[0].get("close") or []
+
+    if not ts_list or not closes or len(ts_list) != len(closes):
+        raise RuntimeError("Yahoo response missing timestamps/closes")
+
+    for ts, c in zip(ts_list, closes):
+        if c is None:
+            continue
+        if to_ny_date(ts) == d:
+            close = _parse_float(c)
+            if math.isfinite(close):
+                return close
+
+    raise RuntimeError(f"No daily close found on Yahoo for {date_iso} (holiday/weekend or data unavailable)")
 
 def payoff_points_vertical(settlement_spx: float, k1: float, k2: float, right: str) -> float:
     """
@@ -244,8 +285,8 @@ def settle_file(
                 if settlement_override is not None:
                     settlement_spx = float(settlement_override)
                 else:
-                    if source == "stooq":
-                        settlement_spx = fetch_spx_close_stooq(exp)
+                    if source == "yahoo":
+                        settlement_spx = fetch_spx_close_yahoo(exp)
                     else:
                         raise ValueError(f"Unknown --source {source!r}")
 
@@ -295,7 +336,7 @@ def settle_file(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", default="./paper_trades.csv", help="Path to paper_trades.csv")
-    ap.add_argument("--source", default="stooq", choices=["stooq"], help="Settlement source")
+    ap.add_argument("--source", default="yahoo", choices=["yahoo"], help="Settlement source")
     ap.add_argument("--exp", default=None, help="Settle only this expiration YYYY-MM-DD")
     ap.add_argument("--settlement", default=None, type=float, help="Override settlement SPX level (points)")
     ap.add_argument("--include-today", action="store_true", help="Allow settling trades with exp == today (run after the close)")

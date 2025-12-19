@@ -32,6 +32,7 @@ from tastytrade.order import (
     OrderTimeInForce,
     OrderType,
 )
+from ttpaper.paper_settle import settle_file
 
 # --- Defaults / "presets" ---
 DEFAULT_SYMBOL = "SPX"
@@ -682,9 +683,28 @@ def sell(
 
 
 @app.command()
-def settle(csv_path: str = "./paper_trades.csv", include_today: bool = False):
-    """List trades whose expiration date has passed."""
-    settle_csv(csv_path, include_today=include_today)
+def settle(
+    csv_path: str = typer.Option("./paper_trades.csv", "--csv-path"),
+    include_today: bool = typer.Option(False, "--include-today"),
+    exp: str | None = typer.Option(None, "--exp"),
+    settlement: float | None = typer.Option(None, "--settlement"),
+    source: str = typer.Option("yahoo", "--source"),
+    apply: bool = typer.Option(False, "--apply", help="Write settlement results back into the CSV"),
+):
+    # keep your existing preview/listing output here if you want
+
+    if not apply:
+        rprint({"csv": csv_path, "note": "preview-only (use --apply to write results)"})
+        return
+
+    n = settle_file(
+        csv_path=csv_path,
+        source=source,
+        exp_filter=exp,
+        settlement_override=settlement,
+        include_today=include_today,
+    )
+    rprint({"csv": csv_path, "settled_rows": n})
 
 
 @app.command()

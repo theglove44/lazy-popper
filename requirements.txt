@@ -3,3 +3,4 @@ typer
 rich
 python-dotenv
 PyYAML
+requests
