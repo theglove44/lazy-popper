@@ -44,8 +44,8 @@ DEFAULT_MAX_SCAN = 250  # hard safety cap (won't be hit usually)
 DEFAULT_WIDTH_POINTS = 5.0
 DEFAULT_QTY = 1
 
-# SPX: contract multiplier $100 per index point :contentReference[oaicite:1]{index=1}
-SPX_MULTIPLIER = Decimal("100")
+# Index contract multiplier $100 per point
+INDEX_MULTIPLIER = Decimal("100")
 
 # SPX min ticks: 0.05 < 3.00, else 0.10 :contentReference[oaicite:2]{index=2}
 TICK_SMALL = Decimal("0.05")
@@ -77,7 +77,7 @@ def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _round_to_spx_tick(x: Decimal) -> Decimal:
+def _round_to_tick(x: Decimal) -> Decimal:
     tick = TICK_SMALL if x < TICK_SWITCH else TICK_LARGE
     return (x / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
 
@@ -435,7 +435,7 @@ def print_stats(csv_path: str) -> dict:
         credit = _safe_float(row.get("limit_credit_points"))
         if credit is not None:
             credit_vals.append(credit)
-            notional_credit += credit * qty * float(SPX_MULTIPLIER)
+            notional_credit += credit * qty * float(INDEX_MULTIPLIER)
 
         mp = _safe_float(row.get("max_profit_usd"))
         if mp is not None:
@@ -536,7 +536,7 @@ def _paper_enter(
     l_bid, l_ask, l_mid = _as_float(l_md.bid), _as_float(l_md.ask), _as_float(l_md.mid)
 
     credit_mid = Decimal(str(s_mid - l_mid))
-    limit_credit = _round_to_spx_tick(credit_mid)  # tick rounding :contentReference[oaicite:9]{index=9}
+    limit_credit = _round_to_tick(credit_mid)  # tick rounding
 
     # Build vertical credit order (SELL short, BUY long)
     q = Decimal(str(qty))
@@ -554,19 +554,27 @@ def _paper_enter(
     )
 
     # DRY RUN DEFAULT: returns BP + fees without placing :contentReference[oaicite:11]{index=11}
-    resp = account.place_order(session, order, dry_run=True)
-
-    bpe = getattr(resp, "buying_power_effect", None)
-    fees = getattr(resp, "fee_calculation", None)
-    errors = getattr(resp, "errors", None)
-    warnings = getattr(resp, "warnings", None)
+    try:
+        resp = account.place_order(session, order, dry_run=True)
+        bpe = getattr(resp, "buying_power_effect", None)
+        fees = getattr(resp, "fee_calculation", None)
+        errors = getattr(resp, "errors", None)
+        warnings = getattr(resp, "warnings", None)
+    except Exception as exc:
+        rprint(f"[yellow]Dry run failed (margin/API error): {exc}[/yellow]")
+        rprint("[yellow]Logging trade anyway with empty BP/fee data.[/yellow]")
+        resp = None
+        bpe = None
+        fees = None
+        errors = [{"code": "DRY_RUN_EXCEPTION", "message": str(exc)}]
+        warnings = None
 
     ivr = _get_ivr(session, symbol)
 
     # Paper P/L boundaries (defined risk)
     width = Decimal(str(width_points))
-    max_profit = limit_credit * SPX_MULTIPLIER * q
-    max_loss = (width - limit_credit) * SPX_MULTIPLIER * q
+    max_profit = limit_credit * INDEX_MULTIPLIER * q
+    max_loss = (width - limit_credit) * INDEX_MULTIPLIER * q
 
     row = {
         "paper_id": str(uuid.uuid4()),

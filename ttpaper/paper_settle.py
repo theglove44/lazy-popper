@@ -4,8 +4,8 @@ Settle SPXW paper trades to expiration and write results back into paper_trades.
 
 Assumptions:
 - Trades are 5-wide (or any width) SPXW vertical *credit* spreads.
-- SPXW is PM-settled based on the closing level of the S&P 500 index on expiration day.
-- We approximate settlement using SPX daily close from Yahoo Finance (^GSPC) unless you override with --settlement.
+- SPXW/RUTW is PM-settled based on the closing level of the index on expiration day.
+- We approximate settlement using daily close from Yahoo Finance (^GSPC, ^RUT) unless you override with --settlement.
 
 Usage:
   python paper_settle.py --csv ./paper_trades.csv
@@ -39,7 +39,7 @@ MULTIPLIER = 100.0  # SPX/SPXW/XSP options multiplier is $100 per index point.
 SETTLE_FIELDS = [
     "status",            # OPEN | SETTLED
     "settled_at_utc",    # ISO timestamp
-    "settlement_spx",    # float
+    "settlement_price",  # float
     "payoff_points",     # float (0..width)
     "pnl_usd_gross",     # float
     "pnl_usd_net",       # float (incl fees_total)
@@ -85,18 +85,33 @@ def _ymd(date_iso: str) -> str:
     return date_iso.replace("-", "")
 
 
-def fetch_spx_close_yahoo(date_iso: str) -> float:
+def fetch_index_close_yahoo(date_iso: str, symbol: str) -> float:
     """
-    Fetch SPX daily close for a single trading date using Yahoo Finance chart API (^GSPC).
-
-    Endpoint:
-      https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?interval=1d&period1=...&period2=...
-
-    We request a small window around date_iso and select the candle whose *America/New_York* date
-    matches date_iso.
-
-    Note: if date_iso is a market holiday/weekend, Yahoo may not return a candle for that date.
+    Fetch daily close for a single trading date using Yahoo Finance chart API.
+    Maps symbol -> yahoo ticker (e.g. SPX -> ^GSPC, RUT -> ^RUT).
     """
+    symbol = symbol.upper().strip()
+    if symbol == "SPX":
+        ticker = "%5EGSPC"  # ^GSPC
+    elif symbol == "RUT":
+        ticker = "%5ERUT"   # ^RUT
+    else:
+        # Fallback or assume it's a direct ticker if not mapped?
+        # For now, let's just use it as is if not one of the known ones,
+        # but encoded for URL safety if needed.
+        # But safest is to raise if unknown or just try.
+        # Let's support SPX and RUT explicitly as requested.
+        pass
+
+    # If it's not one of our known mapped, maybe just try using it directly (or error out)?
+    # The user asked for RUT support.
+    ticker_map = {
+        "SPX": "%5EGSPC",
+        "RUT": "%5ERUT",
+        "XSP": "%5EXSP", # Just in case
+    }
+    ticker = ticker_map.get(symbol, symbol) # Fallback to using symbol as ticker if not found
+
     if requests is None:
         raise RuntimeError("requests is not installed; add it to requirements.txt")
 
@@ -121,7 +136,7 @@ def fetch_spx_close_yahoo(date_iso: str) -> float:
     period2 = int(end.timestamp())
 
     url = (
-        "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC"
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
         f"?interval=1d&period1={period1}&period2={period2}&events=history"
     )
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -158,7 +173,7 @@ def fetch_spx_close_yahoo(date_iso: str) -> float:
 
     raise RuntimeError(f"No daily close found on Yahoo for {date_iso} (holiday/weekend or data unavailable)")
 
-def payoff_points_vertical(settlement_spx: float, k1: float, k2: float, right: str) -> float:
+def payoff_points_vertical(settlement_price: float, k1: float, k2: float, right: str) -> float:
     """
     Payoff (in index points) of the *long* vertical spread with strikes (k_low, k_high).
 
@@ -173,9 +188,9 @@ def payoff_points_vertical(settlement_spx: float, k1: float, k2: float, right: s
 
     right = right.lower().strip()
     if right == "put":
-        payoff = max(k_high - settlement_spx, 0.0) - max(k_low - settlement_spx, 0.0)
+        payoff = max(k_high - settlement_price, 0.0) - max(k_low - settlement_price, 0.0)
     elif right == "call":
-        payoff = max(settlement_spx - k_low, 0.0) - max(settlement_spx - k_high, 0.0)
+        payoff = max(settlement_price - k_low, 0.0) - max(settlement_price - k_high, 0.0)
     else:
         raise ValueError(f"Unsupported right={right!r}")
 
@@ -283,10 +298,11 @@ def settle_file(
 
                 # Choose settlement value
                 if settlement_override is not None:
-                    settlement_spx = float(settlement_override)
+                    settlement_price = float(settlement_override)
                 else:
                     if source == "yahoo":
-                        settlement_spx = fetch_spx_close_yahoo(exp)
+                        symbol = row.get("symbol", "SPX")  # Default to SPX if missing
+                        settlement_price = fetch_index_close_yahoo(exp, symbol)
                     else:
                         raise ValueError(f"Unknown --source {source!r}")
 
@@ -303,13 +319,13 @@ def settle_file(
                 if not math.isfinite(credit_points):
                     raise RuntimeError(f"Missing credit points in row paper_id={row.get('paper_id')}")
 
-                payoff_pts = payoff_points_vertical(settlement_spx, k1, k2, right)
+                payoff_pts = payoff_points_vertical(settlement_price, k1, k2, right)
                 pnl_gross, pnl_net = compute_pnl_usd(credit_points, payoff_pts, qty, fees_total)
                 ror = compute_ror_net(pnl_net, row, credit_points)
 
                 row["status"] = "SETTLED"
                 row["settled_at_utc"] = _iso_utc_now()
-                row["settlement_spx"] = f"{settlement_spx:.4f}"
+                row["settlement_price"] = f"{settlement_price:.4f}"
                 row["payoff_points"] = f"{payoff_pts:.4f}"
                 row["pnl_usd_gross"] = f"{pnl_gross:.2f}"
                 row["pnl_usd_net"] = f"{pnl_net:.2f}"
@@ -321,6 +337,12 @@ def settle_file(
             # Ensure all fields exist for writer
             for c in fieldnames:
                 row.setdefault(c, "")
+            
+            # Remove keys that are not in fieldnames (e.g. None from extra columns)
+            keys_to_remove = [k for k in row.keys() if k not in fieldnames]
+            for k in keys_to_remove:
+                del row[k]
+
             rows.append(row)
 
     # Atomic rewrite
